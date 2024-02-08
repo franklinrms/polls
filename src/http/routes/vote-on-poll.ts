@@ -1,15 +1,17 @@
 import { FastifyInstance } from 'fastify'
-import z from 'zod'
-import { randomUUID } from 'crypto'
+import { z } from 'zod'
+import { randomUUID } from 'node:crypto'
 
 import { prisma } from '../../lib/prisma'
 import { redis } from '../../lib/redis'
+import { voting } from '../../utils/voting-pub-sub'
 
 export async function voteOnPoll(app: FastifyInstance) {
   app.post('/polls/:pollId/votes', async (request, reply) => {
     const voteOnPollBody = z.object({
       pollOptionId: z.string().uuid(),
     })
+
     const voteOnPollParams = z.object({
       pollId: z.string().uuid(),
     })
@@ -20,7 +22,7 @@ export async function voteOnPoll(app: FastifyInstance) {
     let { sessionId } = request.cookies
 
     if (sessionId) {
-      const userPreviousVoteOnPull = await prisma.vote.findUnique({
+      const userPreviousVoteOnPoll = await prisma.vote.findUnique({
         where: {
           sessionId_pollId: {
             sessionId,
@@ -30,19 +32,29 @@ export async function voteOnPoll(app: FastifyInstance) {
       })
 
       if (
-        userPreviousVoteOnPull &&
-        userPreviousVoteOnPull.pollOptionId !== pollOptionId
+        userPreviousVoteOnPoll &&
+        userPreviousVoteOnPoll.pollOptionId !== pollOptionId
       ) {
         await prisma.vote.delete({
           where: {
-            id: userPreviousVoteOnPull.id,
+            id: userPreviousVoteOnPoll.id,
           },
         })
-        await redis.zincrby(pollId, -1, userPreviousVoteOnPull.pollOptionId)
-      } else if (userPreviousVoteOnPull) {
+
+        const votes = await redis.zincrby(
+          pollId,
+          -1,
+          userPreviousVoteOnPoll.pollOptionId,
+        )
+
+        voting.publish(pollId, {
+          pollOptionId: userPreviousVoteOnPoll.pollOptionId,
+          votes: Number(votes),
+        })
+      } else if (userPreviousVoteOnPoll) {
         return reply
           .status(400)
-          .send({ message: 'You already voted on this poll.' })
+          .send({ message: 'You have already voted on this poll' })
       }
     }
 
@@ -65,7 +77,12 @@ export async function voteOnPoll(app: FastifyInstance) {
       },
     })
 
-    await redis.zincrby(pollId, 1, pollOptionId)
+    const votes = await redis.zincrby(pollId, 1, pollOptionId)
+
+    voting.publish(pollId, {
+      pollOptionId,
+      votes: Number(votes),
+    })
 
     return reply.status(201).send()
   })
